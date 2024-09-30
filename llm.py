@@ -12,6 +12,17 @@ from tvm.relax.frontend import nn
 from tvm.relax.frontend.nn import Tensor, op
 from tvm.relax.frontend.nn.llm.kv_cache import PagedKVCache, TIRPagedKVCache
 from tvm.runtime import ShapeTuple
+from datasets import load_dataset
+
+import numpy as np
+import safetensors.torch
+import torch
+from transformers import AutoTokenizer
+import time
+
+HF_WEIGHT_PATH = Path("./TinyLlama-1.1B-Chat-v1.0/")
+if HF_WEIGHT_PATH is None or not HF_WEIGHT_PATH.exists():
+    raise ValueError("Please set the HF_WEIGHT_PATH to the path of the pre-trained weights.")
 
 @dataclasses.dataclass
 class LlamaConfig:
@@ -288,78 +299,13 @@ with target:
     ex = relax.build(mod, target, pipeline=relax.get_pipeline("opt_llm"))
     vm = relax.VirtualMachine(ex, dev)
 
-IS_IN_CI = os.getenv("CI", "") == "true"
 
-#HF_WEIGHT_PATH = None
-HF_WEIGHT_PATH = Path("./TinyLlama-1.1B-Chat-v1.0/")
+########################################################################
 
-if not IS_IN_CI:
-    import numpy as np
-    import safetensors.torch
-    import torch
+def sample_token(logits):
+    logits_np = logits.numpy()
+    return np.argmax(logits_np)
 
-    if HF_WEIGHT_PATH is None or not HF_WEIGHT_PATH.exists():
-        raise ValueError("Please set the HF_WEIGHT_PATH to the path of the pre-trained weights.")
-
-    # Torch format weights
-    param_dict = safetensors.torch.load_file(HF_WEIGHT_PATH / "model.safetensors", device="cpu")
-    # Numpy format weights
-    param_dict = {
-        k: v.half().numpy() if v.dtype == torch.bfloat16 else v.numpy()
-        for k, v in param_dict.items()
-    }
-
-    named_params = dict(named_params)
-    for i in range(model_config.num_hidden_layers):
-        # Add QKV in self attention
-        attn = f"model.layers.{i}.self_attn"
-        param_dict[f"{attn}.qkv_proj.weight"] = np.concatenate(
-            [
-                param_dict.pop(f"{attn}.q_proj.weight"),  # Pop the old parameters to save memory
-                param_dict.pop(f"{attn}.k_proj.weight"),
-                param_dict.pop(f"{attn}.v_proj.weight"),
-            ],
-            axis=0,
-        )
-        # Add gates in MLP
-        mlp = f"model.layers.{i}.mlp"
-        param_dict[f"{mlp}.gate_up_proj.weight"] = np.concatenate(
-            [
-                param_dict.pop(f"{mlp}.gate_proj.weight"),
-                param_dict.pop(f"{mlp}.up_proj.weight"),
-            ],
-            axis=0,
-        )
-
-    # Convert params into ndarray
-    params = [
-        tvm.nd.array(param_dict[k].astype("float16"), device=dev) for k in named_params.keys()
-    ]
-
-
-if not IS_IN_CI:
-    from transformers import AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(HF_WEIGHT_PATH)
-    messages = [
-        {"role": "user", "content": "Tell me a joke"},
-    ]
-    prompt = tokenizer.apply_chat_template(messages)
-    input_len = len(prompt)
-
-    # Load prompt tokens into TVM ndarray on the target device
-    tokens = tvm.nd.array(np.array(prompt).astype("int32"), device=dev)
-
-if not IS_IN_CI:
-    kv_cache = vm["create_tir_paged_kv_cache"](
-        ShapeTuple([1]),  # max_batch_size=1
-        ShapeTuple([2048]),  # max_total_seq_len=2048
-        ShapeTuple([2048]),  # prefill_chunk_size=2048
-        ShapeTuple([16]),  # page_size=16
-    )
-
-
-nd_view_func = tvm.get_global_func("vm.builtin.reshape")
 
 
 def embed(tokens, params):
@@ -368,44 +314,124 @@ def embed(tokens, params):
     _embed = nd_view_func(_embed, ShapeTuple([1, _embed.shape[0], _embed.shape[1]]))
     return _embed
 
+
+
+
+
+# Torch format weights
+param_dict = safetensors.torch.load_file(HF_WEIGHT_PATH / "model.safetensors", device="cpu")
+# Numpy format weights
+param_dict = {
+    k: v.half().numpy() if v.dtype == torch.bfloat16 else v.numpy()
+    for k, v in param_dict.items()
+}
+
+named_params = dict(named_params)
+for i in range(model_config.num_hidden_layers):
+    # Add QKV in self attention
+    attn = f"model.layers.{i}.self_attn"
+    param_dict[f"{attn}.qkv_proj.weight"] = np.concatenate(
+        [
+            param_dict.pop(f"{attn}.q_proj.weight"),  # Pop the old parameters to save memory
+            param_dict.pop(f"{attn}.k_proj.weight"),
+            param_dict.pop(f"{attn}.v_proj.weight"),
+        ],
+        axis=0,
+    )
+    # Add gates in MLP
+    mlp = f"model.layers.{i}.mlp"
+    param_dict[f"{mlp}.gate_up_proj.weight"] = np.concatenate(
+        [
+            param_dict.pop(f"{mlp}.gate_proj.weight"),
+            param_dict.pop(f"{mlp}.up_proj.weight"),
+        ],
+        axis=0,
+    )
+
+# Convert params into ndarray
+params = [
+    tvm.nd.array(param_dict[k].astype("float16"), device=dev) for k in named_params.keys()
+]
+
+tokenizer = AutoTokenizer.from_pretrained(HF_WEIGHT_PATH)
+
+#Input prompt
+
+ds = load_dataset("tatsu-lab/alpaca", split="train")
+
+#Filtered len(input) == 16
+ds_16 = ds.filter(lambda example: 16 == len(tokenizer(example['instruction'])['input_ids']) and 0 == len(example['input']))
+
+
+iteration = 20
+summarazation_t = 0
+generation_t = 0
+token_count = 0 
+global_t = 0
+
+nd_view_func = tvm.get_global_func("vm.builtin.reshape")
+
 add_sequence_func = tvm.get_global_func("vm.builtin.kv_state_add_sequence")
 begin_forward_func = tvm.get_global_func("vm.builtin.kv_state_begin_forward")
 end_forward_func = tvm.get_global_func("vm.builtin.kv_state_end_forward")
 
 
-if not IS_IN_CI:
+for i in range(iteration):
+    print (f"Iteration {i}")
+    messages = [
+        {"role": "user", "content": ""},
+    ]
+    messages[0]['content'] = ds_16[i]['instruction']
+
+    start_g = time.time()
+    prompt = tokenizer.apply_chat_template(messages)
+    input_len = len(prompt)
+
+# Load prompt tokens into TVM ndarray on the target device
+    tokens = tvm.nd.array(np.array(prompt).astype("int32"), device=dev)
+
+    kv_cache = vm["create_tir_paged_kv_cache"](
+        ShapeTuple([1]),  # max_batch_size=1
+        ShapeTuple([model_config.context_window_size]),  # max_total_seq_len=2048
+        ShapeTuple([2048]),  # prefill_chunk_size=2048
+        ShapeTuple([16]),  # page_size=16
+    )
+
     seq_id = 0
     add_sequence_func(kv_cache, seq_id)
     hidden_states = embed(tokens, params)
-    print(f"hidden_states.shape: {hidden_states.shape}")
 
 
+#Prefill stage(Summarization)
+    start = time.time()
     begin_forward_func(kv_cache, ShapeTuple([seq_id]), ShapeTuple([input_len]))
     logits, kv_cache = vm["prefill"](hidden_states, kv_cache, params)
     end_forward_func(kv_cache)
+    summarazation_t = (time.time() - start) + summarazation_t
 
-def sample_token(logits):
-    logits_np = logits.numpy()
-    return np.argmax(logits_np)
-
-
-if not IS_IN_CI:
     last_token = sample_token(logits)
     output_tokens = [last_token]
 
-
-if not IS_IN_CI:
-    print("The generated token:")
-
-    while last_token != tokenizer.eos_token_id:
+#Generate stage(Generation)
+    while last_token != tokenizer.eos_token_id and (len(output_tokens) + input_len) < model_config.context_window_size:
         tokens = tvm.nd.array(np.array([last_token]).astype("int32"), device=dev)
         hidden_states = embed(tokens, params)
+
+        start = time.time()
         begin_forward_func(kv_cache, ShapeTuple([seq_id]), ShapeTuple([1]))
         logits, kv_cache = vm["decode"](hidden_states, kv_cache, params)
-
         end_forward_func(kv_cache)
-        last_token = sample_token(logits)
-        print(tokenizer.decode(last_token))
-        output_tokens.append(last_token)
+        generation_t = (time.time() - start) + generation_t
 
-    print(tokenizer.decode(output_tokens))
+        last_token = sample_token(logits)
+        output_tokens.append(last_token)
+    global_t = (time.time() - start_g) + global_t
+
+    token_count = len(output_tokens) + token_count
+
+latency_g = token_count / (global_t)
+latency = token_count / (summarazation_t + generation_t)
+
+print(f"Summarazation Time : {summarazation_t} Generation Time : {generation_t}")
+print(f"Forward Latnecy(token/s) : {latency}")
+print(f"Global Latnecy(token/s) : {latency_g}")
